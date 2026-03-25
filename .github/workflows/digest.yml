@@ -2,8 +2,8 @@ name: Pulse Digest
 
 on:
   schedule:
-    # 7:00 AM Santo Domingo (UTC-4) = 11:00 UTC — Monday and Thursday
-    - cron: '0 11 * * 1,4'
+    # 7:00 AM Santo Domingo (UTC-4) = 11:00 UTC — daily
+    - cron: '0 11 * * *'
   workflow_dispatch:
 
 jobs:
