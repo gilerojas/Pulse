@@ -1,5 +1,5 @@
 """
-Señal: pulls AI news from RSS feeds, scores them via Claude API for relevance
+Señal: pulls AI news from RSS feeds, scores them via GLM for relevance
 to a specific profile, and emails the top 5 as a personalized HTML digest to
 Gmail. Designed to run on a schedule (e.g. GitHub Actions) in the morning.
 """
@@ -85,7 +85,8 @@ Return ONLY valid JSON. No preamble, no explanation outside the JSON.
 MAX_ARTICLES = 60
 DAYS_BACK = 3
 TOP_N = 5
-DEFAULT_ANTHROPIC_MODEL = "claude-sonnet-5"
+DEFAULT_GLM_MODEL = "glm-5.2"
+DEFAULT_GLM_BASE_URL = "https://api.z.ai/api/coding/paas/v4"
 
 logging.basicConfig(
     level=logging.INFO,
@@ -104,7 +105,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--health-check",
         action="store_true",
-        help="Validate required configuration without calling feeds, Claude, or SMTP.",
+        help="Validate required configuration without calling feeds, GLM, or SMTP.",
     )
     parser.add_argument(
         "--send-test-email",
@@ -119,27 +120,36 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
-def load_runtime_config() -> dict[str, str]:
+def load_runtime_config(
+    require_llm: bool = True,
+    require_smtp: bool = True,
+) -> dict[str, str]:
     """Load runtime config from env, keeping recipient and model configurable."""
     gmail_user = os.environ.get("GMAIL_USER", "").strip()
+    glm_api_key = (
+        os.environ.get("GLM_API_KEY", "").strip()
+        or os.environ.get("ZAI_API_KEY", "").strip()
+        or os.environ.get("Z_AI_API_KEY", "").strip()
+    )
     config = {
-        "api_key": os.environ.get("ANTHROPIC_API_KEY", "").strip(),
+        "glm_api_key": glm_api_key,
         "gmail_user": gmail_user,
         "gmail_password": os.environ.get("GMAIL_APP_PASSWORD", "").strip(),
         "email_to": os.environ.get("EMAIL_TO", "").strip() or gmail_user,
-        "anthropic_model": os.environ.get("ANTHROPIC_MODEL", "").strip()
-        or DEFAULT_ANTHROPIC_MODEL,
+        "glm_model": os.environ.get("GLM_MODEL", "").strip() or DEFAULT_GLM_MODEL,
+        "glm_base_url": os.environ.get("GLM_BASE_URL", "").strip() or DEFAULT_GLM_BASE_URL,
+        "glm_timeout": os.environ.get("GLM_TIMEOUT", "").strip() or "120",
     }
 
-    missing = [
-        name
-        for name, value in (
-            ("ANTHROPIC_API_KEY", config["api_key"]),
+    required: list[tuple[str, str]] = []
+    if require_llm:
+        required.append(("GLM_API_KEY", config["glm_api_key"]))
+    if require_smtp:
+        required.extend([
             ("GMAIL_USER", config["gmail_user"]),
             ("GMAIL_APP_PASSWORD", config["gmail_password"]),
-        )
-        if not value
-    ]
+        ])
+    missing = [name for name, value in required if not value]
     if missing:
         raise SystemExit(f"Missing env: set {', '.join(missing)}.")
     return config
@@ -148,7 +158,9 @@ def load_runtime_config() -> dict[str, str]:
 def log_health_check(config: dict[str, str]) -> None:
     """Log config shape without exposing secret values."""
     logger.info("Config OK")
-    logger.info("Anthropic model: %s", config["anthropic_model"])
+    logger.info("GLM model: %s", config["glm_model"])
+    logger.info("GLM base URL: %s", config["glm_base_url"])
+    logger.info("GLM API key configured: %s", bool(config["glm_api_key"]))
     logger.info("Gmail user configured: %s", bool(config["gmail_user"]))
     logger.info("Email recipient: %s", config["email_to"])
 
@@ -332,7 +344,7 @@ def build_feed_config() -> list[tuple[str, str]]:
 
 
 def build_user_message(articles: list[dict]) -> str:
-    """Build the user message sent to Claude with all article blocks."""
+    """Build the user message sent to the scoring model with all article blocks."""
     blocks = []
     for a in articles:
         blocks.append(
@@ -361,46 +373,84 @@ Return this exact JSON structure:
     return body
 
 
-def score_with_claude(articles: list[dict], api_key: str, model: str) -> list[dict]:
-    """
-    Send all articles to Claude and return the top N as structured data.
-    Raises if the API call fails or response is not valid JSON.
-    """
-    if not articles:
-        return []
-
-    from anthropic import Anthropic
-
-    client = Anthropic(api_key=api_key)
-    user_message = build_user_message(articles)
-
-    response = client.messages.create(
-        model=model,
-        max_tokens=4096,
-        system=SYSTEM_PROMPT,
-        messages=[{"role": "user", "content": user_message}],
-    )
-
-    text = ""
-    for block in response.content:
-        if hasattr(block, "text"):
-            text += block.text
-
+def extract_json_text(text: str) -> str:
+    """Extract JSON text from a model response that may include code fences."""
     text = text.strip()
-    # Allow optional markdown code fence around JSON
     if text.startswith("```"):
         lines = text.split("\n")
         if lines[0].startswith("```"):
             lines = lines[1:]
         if lines and lines[-1].strip() == "```":
             lines = lines[:-1]
-        text = "\n".join(lines)
+        text = "\n".join(lines).strip()
+    return text
+
+
+def score_with_glm(
+    articles: list[dict],
+    api_key: str,
+    model: str,
+    base_url: str,
+    timeout: float,
+) -> list[dict]:
+    """
+    Send all articles to GLM via the Z.AI OpenAI-compatible API.
+    Raises if the API call fails or response is not valid JSON.
+    """
+    if not articles:
+        return []
+
+    import requests
+
+    user_message = build_user_message(articles)
+    url = f"{base_url.rstrip('/')}/chat/completions"
+    response = requests.post(
+        url,
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        },
+        json={
+            "model": model,
+            "messages": [
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": user_message},
+            ],
+            "max_tokens": 4096,
+            "temperature": 0.2,
+            "stream": False,
+        },
+        timeout=timeout,
+    )
+    try:
+        response.raise_for_status()
+    except requests.HTTPError as e:
+        body = response.text[:1000]
+        logger.error("GLM API request failed: HTTP %s — %s", response.status_code, body)
+        raise SystemExit("GLM API request failed. See log for response body.") from e
+
+    payload = response.json()
+    try:
+        content = payload["choices"][0]["message"]["content"]
+    except (KeyError, IndexError, TypeError) as e:
+        logger.error("GLM API returned unexpected response shape: %s", payload)
+        raise SystemExit("GLM API returned unexpected response shape.") from e
+
+    if isinstance(content, list):
+        text = "".join(
+            part.get("text", "") if isinstance(part, dict) else str(part)
+            for part in content
+        )
+    else:
+        text = str(content)
+
+    text = extract_json_text(text)
 
     try:
         data = json.loads(text)
     except json.JSONDecodeError as e:
-        logger.error("Claude API returned invalid JSON. Raw response:\n%s", text)
-        raise SystemExit("Claude API returned invalid JSON. See log for raw response.") from e
+        logger.error("GLM API returned invalid JSON. Raw response:\n%s", text)
+        raise SystemExit("GLM API returned invalid JSON. See log for raw response.") from e
 
     top = data.get("top_articles") or []
     return top[:TOP_N] if isinstance(top, list) else []
@@ -461,7 +511,7 @@ def format_digest_html(
         if i < len(top_articles) - 1:
             parts.append("<hr style='border: none; border-top: 1px solid #eee; margin: 24px 0;'>")
     parts.append("<hr style='border: none; border-top: 1px solid #eee; margin: 24px 0;'>")
-    parts.append("<p style='color: #999; font-size: 0.85rem;'>Powered by Claude + GitHub Actions</p>")
+    parts.append("<p style='color: #999; font-size: 0.85rem;'>Powered by GLM + GitHub Actions</p>")
     parts.append("</body></html>")
     return "\n".join(parts)
 
@@ -501,9 +551,12 @@ def send_test_email(gmail_user: str, gmail_password: str, recipient: str) -> Non
 
 
 def main(argv: list[str] | None = None) -> None:
-    """Pull feeds, score with Claude, send digest email."""
+    """Pull feeds, score with GLM, send digest email."""
     args = parse_args(argv)
-    config = load_runtime_config()
+    config = load_runtime_config(
+        require_llm=not args.send_test_email,
+        require_smtp=not args.dry_run,
+    )
 
     if args.health_check:
         log_health_check(config)
@@ -523,12 +576,18 @@ def main(argv: list[str] | None = None) -> None:
     logger.info("Collected %d articles from feeds", len(articles))
 
     if not articles:
-        logger.warning("No articles in the last %d days; skipping Claude and email.", DAYS_BACK)
+        logger.warning("No articles in the last %d days; skipping GLM and email.", DAYS_BACK)
         return
 
-    top_articles = score_with_claude(articles, config["api_key"], config["anthropic_model"])
+    top_articles = score_with_glm(
+        articles,
+        config["glm_api_key"],
+        config["glm_model"],
+        config["glm_base_url"],
+        float(config["glm_timeout"]),
+    )
     if not top_articles:
-        logger.warning("Claude returned no top articles; skipping email.")
+        logger.warning("GLM returned no top articles; skipping email.")
         return
 
     if args.dry_run:

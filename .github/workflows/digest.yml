@@ -18,7 +18,8 @@ jobs:
     runs-on: ubuntu-latest
     env:
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
-      ANTHROPIC_MODEL: claude-sonnet-5
+      GLM_MODEL: glm-5.2
+      GLM_BASE_URL: https://api.z.ai/api/coding/paas/v4
 
     steps:
       - name: Checkout repository
@@ -35,7 +36,7 @@ jobs:
 
       - name: Validate configuration
         env:
-          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          GLM_API_KEY: ${{ secrets.GLM_API_KEY }}
           GMAIL_USER: ${{ secrets.GMAIL_USER }}
           GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
           EMAIL_TO: ${{ secrets.EMAIL_TO }}
@@ -43,7 +44,7 @@ jobs:
 
       - name: Run digest
         env:
-          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          GLM_API_KEY: ${{ secrets.GLM_API_KEY }}
           GMAIL_USER: ${{ secrets.GMAIL_USER }}
           GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
           EMAIL_TO: ${{ secrets.EMAIL_TO }}
