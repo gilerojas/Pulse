@@ -1,10 +1,10 @@
 """
 Señal: pulls AI news from RSS feeds, scores them via Claude API for relevance
 to a specific profile, and emails the top 5 as a personalized HTML digest to
-Gmail. Designed to run on a schedule (e.g. GitHub Actions) on Monday and
-Thursday mornings.
+Gmail. Designed to run on a schedule (e.g. GitHub Actions) in the morning.
 """
 
+import argparse
 import json
 import logging
 import os
@@ -15,13 +15,33 @@ from datetime import datetime, timedelta, timezone
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from html import escape
+from pathlib import Path
 
-import feedparser
-import requests
-from anthropic import Anthropic
-from dotenv import load_dotenv
+try:
+    from dotenv import load_dotenv
+except ModuleNotFoundError:
+    def load_dotenv(*_args, **_kwargs) -> bool:
+        return False
 
-load_dotenv()
+
+def load_local_env(path: Path) -> None:
+    """Load local .env values for development, with no dependency required."""
+    loaded = load_dotenv(path)
+    if loaded or not path.exists():
+        return
+
+    for line in path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = key.strip()
+        value = value.strip().strip("\"'")
+        if key and key not in os.environ:
+            os.environ[key] = value
+
+
+load_local_env(Path(__file__).with_name(".env"))
 
 # --- CONFIG ---
 
@@ -65,6 +85,7 @@ Return ONLY valid JSON. No preamble, no explanation outside the JSON.
 MAX_ARTICLES = 60
 DAYS_BACK = 3
 TOP_N = 5
+DEFAULT_ANTHROPIC_MODEL = "claude-sonnet-5"
 
 logging.basicConfig(
     level=logging.INFO,
@@ -75,6 +96,61 @@ logger = logging.getLogger(__name__)
 
 
 # --- HELPERS ---
+
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    """Parse command line flags for operational checks and normal runs."""
+    parser = argparse.ArgumentParser(description="Build and email the Pulse AI digest.")
+    parser.add_argument(
+        "--health-check",
+        action="store_true",
+        help="Validate required configuration without calling feeds, Claude, or SMTP.",
+    )
+    parser.add_argument(
+        "--send-test-email",
+        action="store_true",
+        help="Send a simple SMTP test email and exit.",
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Collect and score articles, but do not send the digest email.",
+    )
+    return parser.parse_args(argv)
+
+
+def load_runtime_config() -> dict[str, str]:
+    """Load runtime config from env, keeping recipient and model configurable."""
+    gmail_user = os.environ.get("GMAIL_USER", "").strip()
+    config = {
+        "api_key": os.environ.get("ANTHROPIC_API_KEY", "").strip(),
+        "gmail_user": gmail_user,
+        "gmail_password": os.environ.get("GMAIL_APP_PASSWORD", "").strip(),
+        "email_to": os.environ.get("EMAIL_TO", "").strip() or gmail_user,
+        "anthropic_model": os.environ.get("ANTHROPIC_MODEL", "").strip()
+        or DEFAULT_ANTHROPIC_MODEL,
+    }
+
+    missing = [
+        name
+        for name, value in (
+            ("ANTHROPIC_API_KEY", config["api_key"]),
+            ("GMAIL_USER", config["gmail_user"]),
+            ("GMAIL_APP_PASSWORD", config["gmail_password"]),
+        )
+        if not value
+    ]
+    if missing:
+        raise SystemExit(f"Missing env: set {', '.join(missing)}.")
+    return config
+
+
+def log_health_check(config: dict[str, str]) -> None:
+    """Log config shape without exposing secret values."""
+    logger.info("Config OK")
+    logger.info("Anthropic model: %s", config["anthropic_model"])
+    logger.info("Gmail user configured: %s", bool(config["gmail_user"]))
+    logger.info("Email recipient: %s", config["email_to"])
 
 
 def strip_html(text: str) -> str:
@@ -106,6 +182,9 @@ def fetch_feed(url: str, source_name: str) -> list[dict]:
     First tries a 3-day window; if no items are found but the feed has older
     entries, falls back to a 7-day window. Does not raise.
     """
+    import feedparser
+    import requests
+
     resp = None
     try:
         resp = feedparser.parse(
@@ -193,10 +272,46 @@ def fetch_feed(url: str, source_name: str) -> list[dict]:
 # --- FEED PARSING ---
 
 
+def deduplicate_articles(articles: list[dict]) -> list[dict]:
+    """
+    Remove exact duplicate articles (same URL or same title).
+    Keeps the first occurrence of each unique article.
+    Very conservative: only removes clear duplicates.
+    """
+    seen_urls = set()
+    seen_titles = set()
+    unique_articles = []
+
+    for article in articles:
+        url = article.get("link", "").strip()
+        title = article.get("title", "").strip().lower()
+
+        # Skip if exact URL was already seen
+        if url and url in seen_urls:
+            logger.debug("Duplicate article (URL): %s", article.get("title", ""))
+            continue
+
+        # Skip if exact title was already seen (normalized to lowercase)
+        if title and title in seen_titles:
+            logger.debug("Duplicate article (title): %s", article.get("title", ""))
+            continue
+
+        # Mark as seen
+        if url:
+            seen_urls.add(url)
+        if title:
+            seen_titles.add(title)
+
+        unique_articles.append(article)
+
+    return unique_articles
+
+
 def collect_articles(feed_config: list[tuple[str, str]]) -> list[dict]:
     """
     Fetch all feeds and aggregate articles from the last DAYS_BACK days.
-    Caps at MAX_ARTICLES. Single feed failures are logged and skipped.
+    Deduplicates exact matches, then caps at MAX_ARTICLES.
+    Single feed failures are logged and skipped.
     """
     all_articles = []
     for url, source_name in feed_config:
@@ -204,6 +319,7 @@ def collect_articles(feed_config: list[tuple[str, str]]) -> list[dict]:
         all_articles.extend(articles)
 
     all_articles.sort(key=lambda a: a["published"], reverse=True)
+    all_articles = deduplicate_articles(all_articles)
     return all_articles[:MAX_ARTICLES]
 
 
@@ -245,7 +361,7 @@ Return this exact JSON structure:
     return body
 
 
-def score_with_claude(articles: list[dict], api_key: str) -> list[dict]:
+def score_with_claude(articles: list[dict], api_key: str, model: str) -> list[dict]:
     """
     Send all articles to Claude and return the top N as structured data.
     Raises if the API call fails or response is not valid JSON.
@@ -253,11 +369,13 @@ def score_with_claude(articles: list[dict], api_key: str) -> list[dict]:
     if not articles:
         return []
 
+    from anthropic import Anthropic
+
     client = Anthropic(api_key=api_key)
     user_message = build_user_message(articles)
 
     response = client.messages.create(
-        model="claude-sonnet-4-20250514",
+        model=model,
         max_tokens=4096,
         system=SYSTEM_PROMPT,
         messages=[{"role": "user", "content": user_message}],
@@ -289,6 +407,27 @@ def score_with_claude(articles: list[dict], api_key: str) -> list[dict]:
 
 
 # --- EMAIL ---
+
+
+def send_html_email(
+    subject: str,
+    html: str,
+    gmail_user: str,
+    gmail_password: str,
+    recipient: str,
+) -> None:
+    """Send an HTML email through Gmail SMTP."""
+    msg = MIMEMultipart("alternative")
+    msg["Subject"] = subject
+    msg["From"] = gmail_user
+    msg["To"] = recipient
+    msg.attach(MIMEText(html, "html", "utf-8"))
+
+    with smtplib.SMTP("smtp.gmail.com", 587) as smtp:
+        smtp.starttls()
+        smtp.login(gmail_user, gmail_password)
+        smtp.sendmail(gmail_user, [recipient], msg.as_string())
+    logger.info("Email sent to %s", recipient)
 
 
 def format_digest_html(
@@ -334,41 +473,45 @@ def send_digest_email(
     date_str: str,
     gmail_user: str,
     gmail_password: str,
+    recipient: str,
 ) -> None:
     """
-    Send the digest as HTML email via Gmail SMTP to the same address.
+    Send the digest as HTML email via Gmail SMTP.
     Raises on SMTP failure (delivery failure must not be silent).
     """
     subject = f"📬 Señal — {day_label}, {date_str}"
     by_url = {a["link"]: a for a in articles}
     html = format_digest_html(top_articles, day_label, date_str, by_url)
+    send_html_email(subject, html, gmail_user, gmail_password, recipient)
 
-    msg = MIMEMultipart("alternative")
-    msg["Subject"] = subject
-    msg["From"] = gmail_user
-    msg["To"] = gmail_user
-    msg.attach(MIMEText(html, "html", "utf-8"))
 
-    with smtplib.SMTP("smtp.gmail.com", 587) as smtp:
-        smtp.starttls()
-        smtp.login(gmail_user, gmail_password)
-        smtp.sendmail(gmail_user, [gmail_user], msg.as_string())
-    logger.info("Digest email sent to %s", gmail_user)
+def send_test_email(gmail_user: str, gmail_password: str, recipient: str) -> None:
+    """Send a minimal email to verify Gmail SMTP delivery."""
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    html = (
+        "<!DOCTYPE html><html><body>"
+        "<p>Pulse Digest SMTP test succeeded.</p>"
+        f"<p>Sent at {escape(now)}.</p>"
+        "</body></html>"
+    )
+    send_html_email("Pulse Digest SMTP test", html, gmail_user, gmail_password, recipient)
 
 
 # --- MAIN ---
 
 
-def main() -> None:
+def main(argv: list[str] | None = None) -> None:
     """Pull feeds, score with Claude, send digest email."""
-    api_key = os.environ.get("ANTHROPIC_API_KEY")
-    gmail_user = os.environ.get("GMAIL_USER")
-    gmail_password = os.environ.get("GMAIL_APP_PASSWORD")
+    args = parse_args(argv)
+    config = load_runtime_config()
 
-    if not api_key or not gmail_user or not gmail_password:
-        raise SystemExit(
-            "Missing env: set ANTHROPIC_API_KEY, GMAIL_USER, and GMAIL_APP_PASSWORD."
-        )
+    if args.health_check:
+        log_health_check(config)
+        return
+
+    if args.send_test_email:
+        send_test_email(config["gmail_user"], config["gmail_password"], config["email_to"])
+        return
 
     now = datetime.now(timezone.utc)
     date_str = now.strftime("%Y-%m-%d")
@@ -383,9 +526,13 @@ def main() -> None:
         logger.warning("No articles in the last %d days; skipping Claude and email.", DAYS_BACK)
         return
 
-    top_articles = score_with_claude(articles, api_key)
+    top_articles = score_with_claude(articles, config["api_key"], config["anthropic_model"])
     if not top_articles:
         logger.warning("Claude returned no top articles; skipping email.")
+        return
+
+    if args.dry_run:
+        logger.info("Dry run complete: would send %d articles to %s", len(top_articles), config["email_to"])
         return
 
     send_digest_email(
@@ -393,8 +540,9 @@ def main() -> None:
         articles,
         day_label,
         date_str,
-        gmail_user,
-        gmail_password,
+        config["gmail_user"],
+        config["gmail_password"],
+        config["email_to"],
     )
 
 
