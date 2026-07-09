@@ -34,6 +34,14 @@ jobs:
       - name: Install dependencies
         run: pip install -r pulse_hub/requirements.txt
 
+      - name: Restore seen-article memory
+        uses: actions/cache@v4
+        with:
+          path: pulse_hub/data
+          key: senal-seen-${{ runner.os }}-${{ github.run_id }}
+          restore-keys: |
+            senal-seen-${{ runner.os }}-
+
       - name: Validate configuration
         env:
           GLM_API_KEY: ${{ secrets.GLM_API_KEY }}
