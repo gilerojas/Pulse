@@ -177,6 +177,9 @@ def load_runtime_config(
     require_smtp: bool = True,
 ) -> dict[str, str]:
     gmail_user = os.environ.get("GMAIL_USER", "").strip()
+    # Google app passwords are often copied with spaces; SMTP accepts either, but
+    # stripping is the more reliable form across clients and GitHub secrets.
+    gmail_password = re.sub(r"\s+", "", os.environ.get("GMAIL_APP_PASSWORD", "").strip())
     glm_api_key = (
         os.environ.get("GLM_API_KEY", "").strip()
         or os.environ.get("ZAI_API_KEY", "").strip()
@@ -185,7 +188,7 @@ def load_runtime_config(
     config = {
         "glm_api_key": glm_api_key,
         "gmail_user": gmail_user,
-        "gmail_password": os.environ.get("GMAIL_APP_PASSWORD", "").strip(),
+        "gmail_password": gmail_password,
         "email_to": os.environ.get("EMAIL_TO", "").strip() or gmail_user,
         "glm_model": os.environ.get("GLM_MODEL", "").strip() or DEFAULT_GLM_MODEL,
         "glm_base_url": os.environ.get("GLM_BASE_URL", "").strip() or DEFAULT_GLM_BASE_URL,
@@ -689,17 +692,29 @@ def send_html_email(
     gmail_password: str,
     recipient: str,
 ) -> None:
+    from email.utils import formatdate, make_msgid
+
     msg = MIMEMultipart("alternative")
     msg["Subject"] = subject
-    msg["From"] = f"Señal <{gmail_user}>"
+    msg["From"] = gmail_user
     msg["To"] = recipient
+    msg["Date"] = formatdate(localtime=False, usegmt=True)
+    msg["Message-ID"] = make_msgid(domain=gmail_user.split("@")[-1] if "@" in gmail_user else "localhost")
+    msg["X-Senal"] = "digest-v2"
+    # Plain-text fallback helps some clients / spam filters.
+    plain = strip_html(html)
+    msg.attach(MIMEText(plain, "plain", "utf-8"))
     msg.attach(MIMEText(html, "html", "utf-8"))
 
     with smtplib.SMTP("smtp.gmail.com", 587, timeout=30) as smtp:
+        smtp.ehlo()
         smtp.starttls()
+        smtp.ehlo()
         smtp.login(gmail_user, gmail_password)
-        smtp.sendmail(gmail_user, [recipient], msg.as_string())
-    logger.info("Email sent to %s", recipient)
+        refused = smtp.sendmail(gmail_user, [recipient], msg.as_string())
+        if refused:
+            raise RuntimeError(f"SMTP refused recipients: {refused}")
+    logger.info("Email accepted by Gmail SMTP → %s | subject=%s", recipient, subject)
 
 
 def format_digest_html(
@@ -856,13 +871,18 @@ def send_digest_email(
 
 def send_test_email(gmail_user: str, gmail_password: str, recipient: str) -> None:
     now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    subject = f"Señal SMTP test · {now}"
     html = (
         "<!DOCTYPE html><html><body style='font-family:system-ui,sans-serif;padding:24px;'>"
-        "<p><strong>Señal v2</strong> SMTP test succeeded.</p>"
-        f"<p style='color:#666;'>Sent at {escape(now)}.</p>"
+        "<h2 style='margin:0 0 12px;'>Señal v2 SMTP test</h2>"
+        f"<p>If you can read this, delivery works.</p>"
+        f"<p style='color:#666;'>Sent at {escape(now)}.<br>"
+        f"From: {escape(gmail_user)}<br>To: {escape(recipient)}</p>"
+        "<p style='color:#666;font-size:13px;'>Search Gmail for <strong>Señal SMTP test</strong> "
+        "in <em>All Mail</em>, <em>Spam</em>, and <em>Sent</em> if it is not in Inbox.</p>"
         "</body></html>"
     )
-    send_html_email("Señal v2 SMTP test", html, gmail_user, gmail_password, recipient)
+    send_html_email(subject, html, gmail_user, gmail_password, recipient)
 
 
 # --- MAIN ---

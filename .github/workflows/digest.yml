@@ -5,6 +5,15 @@ on:
     # 7:00 AM Santo Domingo (UTC-4) = 11:00 UTC — daily
     - cron: '0 11 * * *'
   workflow_dispatch:
+    inputs:
+      mode:
+        description: 'full = normal digest; smtp-test = send a tiny delivery test only'
+        required: false
+        default: 'full'
+        type: choice
+        options:
+          - full
+          - smtp-test
 
 permissions:
   contents: read
@@ -20,6 +29,10 @@ jobs:
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
       GLM_MODEL: glm-5.2
       GLM_BASE_URL: https://api.z.ai/api/coding/paas/v4
+      GLM_API_KEY: ${{ secrets.GLM_API_KEY }}
+      GMAIL_USER: ${{ secrets.GMAIL_USER }}
+      GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
+      EMAIL_TO: ${{ secrets.EMAIL_TO }}
 
     steps:
       - name: Checkout repository
@@ -34,7 +47,32 @@ jobs:
       - name: Install dependencies
         run: pip install -r pulse_hub/requirements.txt
 
+      - name: Require mail secrets
+        run: |
+          missing=()
+          [ -z "$GMAIL_USER" ] && missing+=("GMAIL_USER")
+          [ -z "$GMAIL_APP_PASSWORD" ] && missing+=("GMAIL_APP_PASSWORD")
+          if [ ${#missing[@]} -gt 0 ]; then
+            echo "::error::Missing GitHub secrets: ${missing[*]}"
+            exit 1
+          fi
+          echo "GMAIL_USER is set (${#GMAIL_USER} chars)"
+          echo "GMAIL_APP_PASSWORD is set (${#GMAIL_APP_PASSWORD} chars)"
+          if [ -z "$EMAIL_TO" ]; then
+            echo "EMAIL_TO not set — digest will fall back to GMAIL_USER"
+          else
+            echo "EMAIL_TO is set (${#EMAIL_TO} chars)"
+          fi
+          MODE="${{ github.event.inputs.mode }}"
+          MODE="${MODE:-full}"
+          if [ "$MODE" = "full" ] && [ -z "$GLM_API_KEY" ]; then
+            echo "::error::Missing GitHub secret: GLM_API_KEY (required for full digest)"
+            exit 1
+          fi
+          echo "Run mode: $MODE"
+
       - name: Restore seen-article memory
+        if: ${{ github.event.inputs.mode != 'smtp-test' }}
         uses: actions/cache@v4
         with:
           path: pulse_hub/data
@@ -43,17 +81,12 @@ jobs:
             senal-seen-${{ runner.os }}-
 
       - name: Validate configuration
-        env:
-          GLM_API_KEY: ${{ secrets.GLM_API_KEY }}
-          GMAIL_USER: ${{ secrets.GMAIL_USER }}
-          GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
-          EMAIL_TO: ${{ secrets.EMAIL_TO }}
         run: python pulse_hub/digest.py --health-check
 
+      - name: SMTP delivery test
+        if: ${{ github.event.inputs.mode == 'smtp-test' }}
+        run: python pulse_hub/digest.py --send-test-email
+
       - name: Run digest
-        env:
-          GLM_API_KEY: ${{ secrets.GLM_API_KEY }}
-          GMAIL_USER: ${{ secrets.GMAIL_USER }}
-          GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
-          EMAIL_TO: ${{ secrets.EMAIL_TO }}
+        if: ${{ github.event.inputs.mode != 'smtp-test' }}
         run: python pulse_hub/digest.py
